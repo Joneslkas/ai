@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>AI 聊天机器人（简易）</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, "Microsoft YaHei", sans-serif; max-width: 720px; margin: 24px auto; padding: 0 12px; }
+    #chat { border: 1px solid #ddd; padding: 12px; height: 60vh; overflow: auto; background: #fafafa; }
+    .msg { margin: 8px 0; }
+    .user { text-align: right; color: #222; }
+    .assistant { text-align: left; color: #004; }
+    #controls { margin-top: 12px; display:flex; gap:8px; }
+    input[type=text] { flex:1; padding:8px; font-size:16px; }
+    button { padding:8px 12px; }
+  </style>
+</head>
+<body>
+  <h2>AI 聊天机器人（简易）</h2>
+  <div id="chat"></div>
+
+  <div id="controls">
+    <input id="text" type="text" placeholder="输入消息，回车发送" />
+    <button id="send">发送</button>
+  </div>
+
+  <script>
+    const convId = 'default';
+    const chatEl = document.getElementById('chat');
+    const textEl = document.getElementById('text');
+    const sendBtn = document.getElementById('send');
+
+    function appendMsg(role, text) {
+      const d = document.createElement('div');
+      d.className = 'msg ' + (role === 'user' ? 'user' : 'assistant');
+      d.textContent = (role === 'user' ? '你：' : '机器人：') + text;
+      chatEl.appendChild(d);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    // connect SSE
+    const evtSource = new EventSource('/events/' + convId);
+    evtSource.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        appendMsg(msg.role, msg.text);
+        if (msg.role === 'assistant') speakText(msg.text);
+      } catch (err) {
+        console.warn('sse parse', err);
+      }
+    };
+    evtSource.onerror = (err) => {
+      console.warn('SSE error', err);
+    };
+
+    async function sendText() {
+      const text = textEl.value.trim();
+      if (!text) return;
+      appendMsg('user', text);
+      textEl.value = '';
+      try {
+        await fetch('/chat/' + convId, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+      } catch (err) {
+        console.error('send error', err);
+      }
+    }
+
+    sendBtn.addEventListener('click', sendText);
+    textEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendText(); });
+
+    // Browser TTS
+    function speakText(text) {
+      if (!('speechSynthesis' in window)) return;
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = 'zh-CN';
+      utter.rate = 1;
+      speechSynthesis.cancel(); // stop previous if any
+      speechSynthesis.speak(utter);
+    }
+  </script>
+</body>
+</html>
