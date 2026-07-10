@@ -25,7 +25,7 @@ if (OPENAI_KEY) {
     openaiClient = new OpenAI({ apiKey: OPENAI_KEY });
     console.log('OpenAI client initialized');
   } catch (err) {
-    console.warn('OpenAI client could not be initialized. Ensure `openai` is installed. Falling back to local replies.', err.message);
+    console.warn('OpenAI client could not be initialized. Ensure `openai` is installed. Falling back to local replies.', err && err.message ? err.message : err);
     openaiClient = null;
   }
 }
@@ -75,32 +75,103 @@ async function localReply(userMsg) {
 }
 
 // OpenAI-backed reply (if available). Falls back to localReply on error.
+// This implementation tries to handle multiple shapes from different OpenAI client versions:
+// - chat.completions.create (older/newer chat completion style)
+// - responses.create (Responses API style)
 async function aiReply(userMsg) {
   if (!openaiClient) return localReply(userMsg);
   try {
-    // Use Chat Completions via OpenAI client
-    // This uses the newer OpenAI client interface: openai.chat.completions.create
-    const resp = await openaiClient.chat.completions.create({
-      model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
-      messages: [
-        { role: 'system', content: '你是一个友好的中文助理，回答简洁明了。' },
-        { role: 'user', content: userMsg }
-      ],
-      max_tokens: 512,
-      temperature: 0.8,
-    });
-
-    // resp.choices[0].message.content or resp.output[0].content[0].text depending on client version
     let text = null;
-    if (resp && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) {
-      text = resp.choices[0].message.content;
-    } else if (resp && resp.output && resp.output[0] && resp.output[0].content && resp.output[0].content[0] && resp.output[0].content[0].text) {
-      text = resp.output[0].content[0].text;
+    const model = process.env.OPENAI_MODEL || 'gpt-3.5-turbo';
+
+    // 1) Chat Completions style (client.chat.completions.create)
+    if (openaiClient.chat && openaiClient.chat.completions && typeof openaiClient.chat.completions.create === 'function') {
+      try {
+        const resp = await openaiClient.chat.completions.create({
+          model,
+          messages: [
+            { role: 'system', content: '你是一个友好的中文助理，回答简洁明了。' },
+            { role: 'user', content: userMsg }
+          ],
+          max_tokens: 512,
+          temperature: 0.8,
+        });
+        if (resp && resp.choices && resp.choices[0]) {
+          if (resp.choices[0].message && resp.choices[0].message.content) {
+            text = resp.choices[0].message.content;
+          } else if (typeof resp.choices[0].text === 'string') {
+            text = resp.choices[0].text;
+          }
+        }
+      } catch (err) {
+        // swallow and try other styles
+        console.warn('chat.completions path failed:', err && err.message ? err.message : err);
+      }
     }
+
+    // 2) Responses API style (client.responses.create)
+    if (!text && openaiClient.responses && typeof openaiClient.responses.create === 'function') {
+      try {
+        const resp = await openaiClient.responses.create({
+          model,
+          input: userMsg,
+        });
+
+        // Try common shapes:
+        if (resp) {
+          // direct output_text (some wrappers)
+          if (typeof resp.output_text === 'string' && resp.output_text.trim()) {
+            text = resp.output_text;
+          }
+
+          // resp.output is often an array of items
+          if (!text && Array.isArray(resp.output) && resp.output.length > 0) {
+            for (const out of resp.output) {
+              if (typeof out === 'string' && out.trim()) {
+                text = out;
+                break;
+              }
+              // out.content can be string or array
+              if (out && out.content) {
+                if (typeof out.content === 'string' && out.content.trim()) {
+                  text = out.content;
+                  break;
+                }
+                if (Array.isArray(out.content)) {
+                  for (const c of out.content) {
+                    if (typeof c === 'string' && c.trim()) {
+                      text = c;
+                      break;
+                    } else if (c && typeof c.text === 'string' && c.text.trim()) {
+                      text = c.text;
+                      break;
+                    }
+                  }
+                  if (text) break;
+                }
+                // some shapes: out.content[0].text
+                if (out.content && out.content[0] && typeof out.content[0].text === 'string' && out.content[0].text.trim()) {
+                  text = out.content[0].text;
+                  break;
+                }
+              }
+            }
+          }
+
+          // fallback check for choices.message
+          if (!text && resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content) {
+            text = resp.choices[0].message.content;
+          }
+        }
+      } catch (err) {
+        console.warn('responses.create path failed:', err && err.message ? err.message : err);
+      }
+    }
+
     if (!text) return localReply(userMsg);
-    return text.trim();
+    return String(text).trim();
   } catch (err) {
-    console.warn('OpenAI request failed, falling back to local reply:', err.message || err);
+    console.warn('OpenAI request failed or unexpected response shape, falling back to local reply:', err && err.message ? err.message : err);
     return localReply(userMsg);
   }
 }
@@ -114,18 +185,30 @@ async function generateReplyFromModel(userMsg) {
 
 async function handleUserMessage(convId, userMsg, publish) {
   return withLock(convId, async () => {
+    // get next seq for the user message
     const seq = await nextSeq(convId);
+
     // create user message record
-    const userMessageObj = { id: uuidv4(), convId, seq: seq * 1 - 1, role: 'user', text: userMsg, ts: Date.now() };
+    // seq should be the incremented value returned by nextSeq
+    const userMessageObj = { id: uuidv4(), convId, seq, role: 'user', text: userMsg, ts: Date.now() };
     await saveMessageToDb(convId, userMessageObj);
 
     const replyText = await generateReplyFromModel(userMsg);
+
+    // next sequence for assistant reply
     const assistantSeq = await nextSeq(convId);
     const msg = { id: uuidv4(), convId, seq: assistantSeq, role: 'assistant', text: replyText, ts: Date.now() };
     await saveMessageToDb(convId, msg);
 
     // publish to subscribers (SSE/WebSocket)
-    if (publish) await publish(JSON.stringify(msg));
+    if (publish) {
+      try {
+        await publish(JSON.stringify(msg));
+      } catch (err) {
+        // publishing errors should not prevent response
+        console.warn('publish failed:', err && err.message ? err.message : err);
+      }
+    }
     return msg;
   });
 }
